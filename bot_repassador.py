@@ -2,14 +2,15 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 # CONFIGURAÇÕES
-TOKEN = "8378547653:AAF25X5RDPbivxqLRvQSzYrVTn4seqpqDVI"
+TOKEN = "8378547653:AAF25X5RDPbivxqLRvQSzYrVTn4seqpqDVI"  # token do seu bot
 GRUPO_ID = -1003236154348  # ID do grupo
 USUARIO_AUTORIZADO = 5782277642  # seu ID
 
-# Função principal que repassa mensagens (texto, imagens, vídeos, etc)
+# Função que recebe mensagens no privado e repassa para o grupo
 async def repassar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
+    # Só repassa se a mensagem vier do chat privado
     if update.effective_chat.type == "private":
         # Verifica se é o usuário autorizado
         if update.message.from_user.id != USUARIO_AUTORIZADO:
