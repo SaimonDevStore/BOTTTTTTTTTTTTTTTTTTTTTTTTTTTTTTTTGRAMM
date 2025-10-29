@@ -1,1 +1,1 @@
-worker: python3 bot_repassador.py
+web: python3 bot_repassador.py
