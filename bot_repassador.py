@@ -1,8 +1,9 @@
 import os
+import re
 import asyncio
 from aiohttp import web
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 # CONFIGURAÇÕES
 TOKEN = "8378547653:AAF25X5RDPbivxqLRvQSzYrVTn4seqpqDVI"  # token do seu bot
@@ -62,6 +63,102 @@ async def repassar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("Mensagem enviada ao grupo!")
 
+
+# =========================
+# Utilidades para copiar posts
+# =========================
+
+def parse_channel_link_or_args(arg_text: str):
+    """Extrai (from_chat_id_or_username, message_id) de um link t.me ou de '@canal msg_id'.
+    Retorna (source, msg_id) ou (None, None) se inválido.
+    """
+    if not arg_text:
+        return None, None
+
+    arg_text = arg_text.strip()
+
+    # Formatos aceitos:
+    # - https://t.me/<username>/<msg_id>
+    # - t.me/<username>/<msg_id>
+    m = re.search(r"(?:https?://)?t\.me/(?:c/)?([A-Za-z0-9_]+)/([0-9]+)", arg_text)
+    if m:
+        return m.group(1), int(m.group(2))
+
+    # - @canal <msg_id>
+    parts = arg_text.split()
+    if len(parts) == 2 and parts[0].startswith('@') and parts[1].isdigit():
+        return parts[0], int(parts[1])
+
+    return None, None
+
+
+async def copiarpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/copiarpost <link_t.me> ou /copiarpost @canal <msg_id>
+    Copia o post indicado para o seu chat.
+    """
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Use este comando no privado do bot.")
+        return
+
+    args_text = " ".join(context.args) if context.args else ""
+    source, msg_id = parse_channel_link_or_args(args_text)
+
+    if not source:
+        await update.message.reply_text(
+            "Envie o link do post (t.me/usuario/ID) ou '@canal ID'.\n"
+            "Exemplos:\n"
+            "/copiarpost https://t.me/promocoes/123\n"
+            "/copiarpost @promocoes 123\n\n"
+            "Dica: você também pode me encaminhar um post do canal que eu formato pra você."
+        )
+        return
+
+    try:
+        await context.bot.copy_message(
+            chat_id=update.effective_chat.id,
+            from_chat_id=source,
+            message_id=msg_id,
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            "Não consegui copiar o post. Verifique se o canal é público ou se o bot está no canal e o ID está correto."
+        )
+
+
+async def formatar_post_encaminhado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Se o usuário encaminhar um post de canal, formata e devolve texto + mídia.
+    """
+    msg = update.message
+    if not msg or not (msg.forward_from_chat or msg.is_automatic_forward):
+        return
+
+    # Monta descrição
+    descricao = msg.caption or msg.text or ""
+
+    # Heurística simples de preço
+    preco_match = re.search(r"R\$\s?\d+[\.,]?\d*", descricao)
+    preco = preco_match.group(0) if preco_match else "(ajuste o preço)"
+
+    texto_formatado = (
+        "Produto:\n"
+        f"{descricao}\n\n"
+        f"Preço: {preco}\n"
+        "Link de afiliado: <cole o seu aqui>\n"
+    )
+
+    # Envia mídia + texto
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        await context.bot.send_photo(chat_id=msg.chat_id, photo=file_id, caption=texto_formatado)
+    elif msg.video:
+        file_id = msg.video.file_id
+        await context.bot.send_video(chat_id=msg.chat_id, video=file_id, caption=texto_formatado)
+    elif msg.document:
+        file_id = msg.document.file_id
+        await context.bot.send_document(chat_id=msg.chat_id, document=file_id, caption=texto_formatado)
+    else:
+        await context.bot.send_message(chat_id=msg.chat_id, text=texto_formatado)
+
 async def health_check(request):
     """Endpoint simples para o Render verificar que o serviço está rodando"""
     return web.Response(text="Bot está rodando!")
@@ -84,6 +181,8 @@ async def main():
     
     # Inicia o bot do Telegram
     app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("copiarpost", copiarpost))
+    app.add_handler(MessageHandler(filters.FORWARDED & (~filters.ChatType.GROUPS), formatar_post_encaminhado))
     app.add_handler(MessageHandler(filters.ALL, repassar))
     
     # Inicializa o bot de forma assíncrona
