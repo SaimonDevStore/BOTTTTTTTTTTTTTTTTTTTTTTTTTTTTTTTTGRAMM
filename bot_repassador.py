@@ -1,7 +1,9 @@
 import os
 import re
+import random
 import asyncio
-from aiohttp import web
+from typing import Any, Dict, List, Optional
+from aiohttp import web, ClientSession
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -9,6 +11,14 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 TOKEN = "8378547653:AAF25X5RDPbivxqLRvQSzYrVTn4seqpqDVI"  # token do seu bot
 GRUPO_ID = -1003236154348  # ID do grupo
 USUARIO_AUTORIZADO = 5782277642  # seu ID
+
+# SHOPEE - Config via variáveis de ambiente (defina no Render Settings > Environment)
+SHOPEE_API_URL = os.environ.get("SHOPEE_API_URL", "")  # endpoint que lista produtos
+SHOPEE_API_TOKEN = os.environ.get("SHOPEE_API_TOKEN", "")  # token/chave da sua API
+SHOPEE_AFFILIATE_BASE = os.environ.get("SHOPEE_AFFILIATE_BASE", "")  # opcional para construir link
+SHOPEE_CHANNEL_ID_ENV = os.environ.get("SHOPEE_CHANNEL_ID")  # canal destino para posts automáticos
+DEFAULT_POST_INTERVAL_MIN = int(os.environ.get("SHOPEE_POST_INTERVAL_MIN", "180"))  # padrão: 3h
+AUTO_START = os.environ.get("SHOPEE_AUTO_START", "false").lower() == "true"
 
 # Função que recebe mensagens no privado e repassa para o grupo
 async def repassar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -159,6 +169,152 @@ async def formatar_post_encaminhado(update: Update, context: ContextTypes.DEFAUL
     else:
         await context.bot.send_message(chat_id=msg.chat_id, text=texto_formatado)
 
+
+# =========================
+# Shopee: busca e postagem automática
+# =========================
+
+async def fetch_shopee_products(session: ClientSession) -> List[Dict[str, Any]]:
+    """Busca produtos na API da Shopee Afiliados.
+    Espera um JSON com uma lista de produtos. Adapte às respostas reais da sua API.
+    Cada produto idealmente possui: id, name, description, price, discount, image_url, affiliate_url (opcional).
+    """
+    if not SHOPEE_API_URL or not SHOPEE_API_TOKEN:
+        return []
+    headers = {
+        "Authorization": f"Bearer {SHOPEE_API_TOKEN}",
+        "Accept": "application/json",
+    }
+    try:
+        async with session.get(SHOPEE_API_URL, headers=headers, timeout=30) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            # Adapte aqui se a estrutura for diferente
+            if isinstance(data, dict) and "items" in data:
+                return data.get("items", [])
+            if isinstance(data, list):
+                return data
+            return []
+    except Exception:
+        return []
+
+
+def build_affiliate_link(product: Dict[str, Any]) -> Optional[str]:
+    if product.get("affiliate_url"):
+        return product["affiliate_url"]
+    if SHOPEE_AFFILIATE_BASE and product.get("id"):
+        return f"{SHOPEE_AFFILIATE_BASE}{product['id']}"
+    return None
+
+
+def format_product_caption(product: Dict[str, Any]) -> str:
+    name = product.get("name") or product.get("title") or "Produto"
+    description = product.get("description") or ""
+    price = product.get("price") or product.get("price_text") or "(ver preço)"
+    discount = product.get("discount") or product.get("discount_text") or None
+    affiliate = build_affiliate_link(product) or "<cole seu link de afiliado aqui>"
+
+    linhas = [f"{name}"]
+    if description:
+        linhas.append(description)
+    linhas.append("")
+    linhas.append(f"Preço: {price}")
+    if discount:
+        linhas.append(f"Desconto: {discount}")
+    linhas.append(f"Link: {affiliate}")
+    return "\n".join(linhas)
+
+
+async def post_random_shopee_product(context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    bot_data = app.bot_data
+    channel_id = bot_data.get("shopee_channel_id")
+    if not channel_id:
+        # fallback: usa env se setado
+        channel_id = int(SHOPEE_CHANNEL_ID_ENV) if SHOPEE_CHANNEL_ID_ENV else None
+    if not channel_id:
+        return
+
+    async with ClientSession() as session:
+        products = await fetch_shopee_products(session)
+        if not products:
+            return
+        product = random.choice(products)
+
+        caption = format_product_caption(product)
+        image_url = product.get("image_url") or product.get("image")
+
+        try:
+            if image_url:
+                await context.bot.send_photo(chat_id=channel_id, photo=image_url, caption=caption)
+            else:
+                await context.bot.send_message(chat_id=channel_id, text=caption)
+        except Exception:
+            # ignora erro de envio para manter o job vivo
+            pass
+
+
+# Comandos de controle
+async def shopee_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id != USUARIO_AUTORIZADO:
+        await update.message.reply_text("Sem permissão.")
+        return
+    interval_min = context.application.bot_data.get("shopee_interval_min", DEFAULT_POST_INTERVAL_MIN)
+    job_queue = context.application.job_queue
+    # Cancela job anterior se existir
+    for job in job_queue.get_jobs_by_name("shopee_auto_post"):
+        job.schedule_removal()
+    job_queue.run_repeating(post_random_shopee_product, interval=interval_min * 60, first=5, name="shopee_auto_post")
+    await update.message.reply_text(f"Shopee auto-post ON. Intervalo: {interval_min} min")
+
+
+async def shopee_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id != USUARIO_AUTORIZADO:
+        await update.message.reply_text("Sem permissão.")
+        return
+    job_queue = context.application.job_queue
+    removed = False
+    for job in job_queue.get_jobs_by_name("shopee_auto_post"):
+        job.schedule_removal()
+        removed = True
+    await update.message.reply_text("Shopee auto-post OFF" if removed else "Já estava desligado.")
+
+
+async def shopee_set_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id != USUARIO_AUTORIZADO:
+        await update.message.reply_text("Sem permissão.")
+        return
+    if not context.args:
+        await update.message.reply_text("Use: /shopee_channel <ID do canal>")
+        return
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Canal inválido. Envie um número (ex: -1001234567890)")
+        return
+    context.application.bot_data["shopee_channel_id"] = channel_id
+    await update.message.reply_text(f"Canal configurado: {channel_id}")
+
+
+async def shopee_set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id != USUARIO_AUTORIZADO:
+        await update.message.reply_text("Sem permissão.")
+        return
+    if not context.args:
+        await update.message.reply_text("Use: /shopee_interval <minutos>")
+        return
+    try:
+        minutes = int(context.args[0])
+        if minutes < 5:
+            await update.message.reply_text("Mínimo 5 minutos para evitar bloqueios.")
+            return
+    except ValueError:
+        await update.message.reply_text("Envie um número inteiro de minutos.")
+        return
+    context.application.bot_data["shopee_interval_min"] = minutes
+    await update.message.reply_text(f"Intervalo configurado: {minutes} min")
+
 async def health_check(request):
     """Endpoint simples para o Render verificar que o serviço está rodando"""
     return web.Response(text="Bot está rodando!")
@@ -182,13 +338,26 @@ async def main():
     # Inicia o bot do Telegram
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("copiarpost", copiarpost))
+    # Shopee controls
+    app.add_handler(CommandHandler("shopee_on", shopee_on))
+    app.add_handler(CommandHandler("shopee_off", shopee_off))
+    app.add_handler(CommandHandler("shopee_channel", shopee_set_channel))
+    app.add_handler(CommandHandler("shopee_interval", shopee_set_interval))
     app.add_handler(MessageHandler(filters.FORWARDED & (~filters.ChatType.GROUPS), formatar_post_encaminhado))
     app.add_handler(MessageHandler(filters.ALL, repassar))
-    
+
     # Inicializa o bot de forma assíncrona
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
+
+    # Auto start (opcional via env)
+    if AUTO_START:
+        # Intervalo default ou configurado em env já está em DEFAULT_POST_INTERVAL_MIN
+        job_queue = app.job_queue
+        for job in job_queue.get_jobs_by_name("shopee_auto_post"):
+            job.schedule_removal()
+        job_queue.run_repeating(post_random_shopee_product, interval=DEFAULT_POST_INTERVAL_MIN * 60, first=5, name="shopee_auto_post")
     
     print("✅ Bot está rodando e pronto para repassar mensagens (texto, imagem, vídeo, etc)...")
     
