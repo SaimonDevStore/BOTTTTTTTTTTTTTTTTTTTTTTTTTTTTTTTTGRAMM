@@ -2,6 +2,7 @@ import os
 import re
 import random
 import asyncio
+import unicodedata
 from typing import Any, Dict, List, Optional
 from aiohttp import web, ClientSession
 from telegram import Update
@@ -19,6 +20,17 @@ SHOPEE_AFFILIATE_BASE = os.environ.get("SHOPEE_AFFILIATE_BASE", "")  # opcional 
 SHOPEE_CHANNEL_ID_ENV = os.environ.get("SHOPEE_CHANNEL_ID")  # canal destino para posts automáticos
 DEFAULT_POST_INTERVAL_MIN = int(os.environ.get("SHOPEE_POST_INTERVAL_MIN", "180"))  # padrão: 3h
 AUTO_START = os.environ.get("SHOPEE_AUTO_START", "false").lower() == "true"
+
+# Filtros de produto (palavras-chave e categorias)
+DEFAULT_KEYWORDS = [
+    "gamer","gabinete","gabinetes","placa de video","placa de vídeo","gpu",
+    "mousepad","mouse","teclado","mecanico","mecânico","headset","headphone",
+    "placa mae","placa mãe","processador","cpu","monitor","cadeira gamer",
+    "rgb","setup","decoracao","decoração","led","luminaria","luminária",
+    "suporte","mesa gamer","mesa pc","cooler","water cooler","fan",
+]
+SHOPEE_KEYWORDS = [k.strip().lower() for k in os.environ.get("SHOPEE_KEYWORDS", ",".join(DEFAULT_KEYWORDS)).split(",") if k.strip()]
+SHOPEE_CATEGORY_IDS = [p.strip() for p in os.environ.get("SHOPEE_CATEGORY_IDS", "").split(",") if p.strip()]
 
 # Função que recebe mensagens no privado e repassa para o grupo
 async def repassar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -185,8 +197,13 @@ async def fetch_shopee_products(session: ClientSession) -> List[Dict[str, Any]]:
         "Authorization": f"Bearer {SHOPEE_API_TOKEN}",
         "Accept": "application/json",
     }
+    params = {}
+    if SHOPEE_CATEGORY_IDS:
+        # Muitas APIs aceitam algo como category_ids=1,2,3 — ajuste conforme sua API
+        params["category_ids"] = ",".join(SHOPEE_CATEGORY_IDS)
+
     try:
-        async with session.get(SHOPEE_API_URL, headers=headers, timeout=30) as resp:
+        async with session.get(SHOPEE_API_URL, headers=headers, params=params or None, timeout=30) as resp:
             if resp.status != 200:
                 return []
             data = await resp.json()
@@ -198,6 +215,26 @@ async def fetch_shopee_products(session: ClientSession) -> List[Dict[str, Any]]:
             return []
     except Exception:
         return []
+
+
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join([c for c in nfkd if not unicodedata.combining(c)]).lower()
+
+
+def product_matches_keywords(product: Dict[str, Any]) -> bool:
+    name = product.get("name") or product.get("title") or ""
+    description = product.get("description") or ""
+    category = product.get("category") or product.get("category_name") or ""
+    blob = f"{name}\n{description}\n{category}"
+    blob_n = normalize_text(blob)
+    for kw in SHOPEE_KEYWORDS:
+        kw_n = normalize_text(kw)
+        if kw_n and kw_n in blob_n:
+            return True
+    return False
 
 
 def build_affiliate_link(product: Dict[str, Any]) -> Optional[str]:
@@ -240,7 +277,9 @@ async def post_random_shopee_product(context: ContextTypes.DEFAULT_TYPE):
         products = await fetch_shopee_products(session)
         if not products:
             return
-        product = random.choice(products)
+        filtered = [p for p in products if product_matches_keywords(p)]
+        pool = filtered if filtered else products  # fallback se filtro ficar vazio
+        product = random.choice(pool)
 
         caption = format_product_caption(product)
         image_url = product.get("image_url") or product.get("image")
